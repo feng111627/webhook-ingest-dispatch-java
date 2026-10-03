@@ -2,6 +2,8 @@ package com.github.feng111627.webhookingestdispatchjava.model;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * 一个被接收的事件及其处理结论（内存存储，本地演示用）。
@@ -18,6 +20,9 @@ public class EventRecord {
     private String lastError;
     private Instant receivedAt;
     private Instant updatedAt;
+
+    /** 历次死信重放留档（含每次实际使用的负载来源/修正负载/结论），只追加不改写 */
+    private final List<ReplayAttempt> replayHistory = new CopyOnWriteArrayList<>();
 
     public String getEventId() { return eventId; }
     public void setEventId(String eventId) { this.eventId = eventId; }
@@ -48,4 +53,6 @@ public class EventRecord {
 
     public Instant getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(Instant updatedAt) { this.updatedAt = updatedAt; }
+
+    public List<ReplayAttempt> getReplayHistory() { return replayHistory; }
 }

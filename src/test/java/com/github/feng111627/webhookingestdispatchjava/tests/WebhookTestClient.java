@@ -63,4 +63,30 @@ public final class WebhookTestClient {
         String base = "\"eventId\":\"" + eventId + "\",\"eventType\":\"" + eventType + "\"";
         return "{" + base + (extraJson == null || extraJson.isBlank() ? "" : "," + extraJson) + "}";
     }
+
+    /** 重放（空体：沿用原始负载）。 */
+    public static ResponseEntity<String> replayEmpty(TestRestTemplate rest, String baseUrl, String eventId) {
+        return rest.exchange(
+                baseUrl + "/admin/dead-letters/" + eventId + "/replay",
+                org.springframework.http.HttpMethod.POST,
+                HttpEntity.EMPTY,
+                String.class);
+    }
+
+    /** 重放并携带人工修正负载（JSON 文本）。 */
+    public static ResponseEntity<String> replayWithBody(TestRestTemplate rest, String baseUrl,
+                                                        String eventId, String correctedJson) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.add("Content-Type", "application/json");
+        return rest.exchange(
+                baseUrl + "/admin/dead-letters/" + eventId + "/replay",
+                org.springframework.http.HttpMethod.POST,
+                new HttpEntity<>(correctedJson, headers),
+                String.class);
+    }
+
+    /** 管理端 GET（死信详情 / 判定轨迹等）。 */
+    public static ResponseEntity<String> adminGet(TestRestTemplate rest, String baseUrl, String path) {
+        return rest.getForEntity(baseUrl + path, String.class);
+    }
 }

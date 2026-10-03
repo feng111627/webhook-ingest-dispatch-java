@@ -9,8 +9,11 @@ import com.github.feng111627.webhookingestdispatchjava.handler.EventHandlerRegis
 import com.github.feng111627.webhookingestdispatchjava.model.EventRecord;
 import com.github.feng111627.webhookingestdispatchjava.model.EventState;
 import com.github.feng111627.webhookingestdispatchjava.model.FailureKind;
+import com.github.feng111627.webhookingestdispatchjava.model.TraceEntry;
+import com.github.feng111627.webhookingestdispatchjava.model.TracePhase;
 import com.github.feng111627.webhookingestdispatchjava.security.SignatureVerifier;
 import com.github.feng111627.webhookingestdispatchjava.store.EventStore;
+import com.github.feng111627.webhookingestdispatchjava.store.TraceStore;
 import java.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,17 +41,20 @@ public class WebhookIngestService {
 
     private final SignatureVerifier signatureVerifier;
     private final EventStore eventStore;
+    private final TraceStore traceStore;
     private final EventHandlerRegistry registry;
     private final DispatchService dispatchService;
     private final ObjectMapper objectMapper;
 
     public WebhookIngestService(SignatureVerifier signatureVerifier,
                                 EventStore eventStore,
+                                TraceStore traceStore,
                                 EventHandlerRegistry registry,
                                 DispatchService dispatchService,
                                 ObjectMapper objectMapper) {
         this.signatureVerifier = signatureVerifier;
         this.eventStore = eventStore;
+        this.traceStore = traceStore;
         this.registry = registry;
         this.dispatchService = dispatchService;
         this.objectMapper = objectMapper;
@@ -75,6 +81,13 @@ public class WebhookIngestService {
         String eventId = textField(payload, "eventId");
         String eventType = textField(payload, "eventType");
 
+        if (eventId != null) {
+            traceStore.append(TraceEntry.builder(eventId, TracePhase.RECEIVED)
+                    .decision("接收请求：JSON 对象解析通过，准备按判定顺序校验(eventType="
+                            + (eventType == null ? "(缺省)" : eventType) + ")")
+                    .apiConclusion(null));
+        }
+
         // 1~2. 时间戳（先缺失后过期）
         signatureVerifier.verify(eventId, timestampHeader, signatureHeader, rawBody)
                 .ifPresent(reason -> {
@@ -85,6 +98,12 @@ public class WebhookIngestService {
                         case SIGNATURE_INVALID -> "签名不匹配，请检查密钥与签名内容(timestamp + '.' + body)";
                         default -> "请求被拒绝: " + reason;
                     };
+                    if (eventId != null) {
+                        traceStore.append(TraceEntry.builder(eventId, TracePhase.REJECTED)
+                                .failureKind(reason.name())
+                                .decision("校验被拒：" + reason + " - " + message)
+                                .apiConclusion(reason.name()));
+                    }
                     throw rejected(reason, message, eventId);
                 });
 
@@ -93,6 +112,10 @@ public class WebhookIngestService {
             throw rejected(RejectReason.BAD_REQUEST, "负载缺少 eventId", null);
         }
         if (eventType == null || eventType.isBlank()) {
+            traceStore.append(TraceEntry.builder(eventId, TracePhase.REJECTED)
+                    .failureKind(RejectReason.BAD_REQUEST.name())
+                    .decision("校验被拒：负载缺少 eventType -> BAD_REQUEST")
+                    .apiConclusion(RejectReason.BAD_REQUEST.name()));
             throw rejected(RejectReason.BAD_REQUEST, "负载缺少 eventType", eventId);
         }
 
@@ -100,6 +123,10 @@ public class WebhookIngestService {
         if (registry.lookup(eventType).isEmpty()) {
             log.info("[ingest eventId={}] REJECT: 无匹配处理器(type={}) -> UNSUPPORTED_EVENT_TYPE",
                     eventId, eventType);
+            traceStore.append(TraceEntry.builder(eventId, TracePhase.REJECTED)
+                    .failureKind(RejectReason.UNSUPPORTED_EVENT_TYPE.name())
+                    .decision("无匹配处理器(type=" + eventType + ")，事件被明确拒绝、不写入存储 -> 422")
+                    .apiConclusion(RejectReason.UNSUPPORTED_EVENT_TYPE.name()));
             throw new WebhookRejectedException(RejectReason.UNSUPPORTED_EVENT_TYPE,
                     "没有匹配事件类型 '" + eventType + "' 的处理器，事件不会被静默丢弃",
                     HttpStatus.UNPROCESSABLE_ENTITY.value());
@@ -123,6 +150,10 @@ public class WebhookIngestService {
             // 重复请求按成功返回，但绝不再次分发
             log.info("[ingest eventId={}] DUPLICATE: 当前状态 state={} attempts={} -> 返回成功且不再分发",
                     eventId, existing.getState(), existing.getAttempts());
+            traceStore.append(TraceEntry.builder(eventId, TracePhase.DUPLICATE)
+                    .decision("命中幂等占位：事件已存在(state=" + existing.getState()
+                            + ", attempts=" + existing.getAttempts() + ")，不再分发，按成功返回")
+                    .apiConclusion("DUPLICATE"));
             return new IngestResponse(eventId, "DUPLICATE",
                     "事件已接收/处理过，按成功返回且不重复分发", existing.getAttempts());
         }
