@@ -9,8 +9,11 @@ import com.github.feng111627.webhookingestdispatchjava.handler.EventHandlerRegis
 import com.github.feng111627.webhookingestdispatchjava.model.EventRecord;
 import com.github.feng111627.webhookingestdispatchjava.model.EventState;
 import com.github.feng111627.webhookingestdispatchjava.model.FailureKind;
+import com.github.feng111627.webhookingestdispatchjava.model.TraceEntry;
+import com.github.feng111627.webhookingestdispatchjava.model.TraceStep;
 import com.github.feng111627.webhookingestdispatchjava.security.SignatureVerifier;
 import com.github.feng111627.webhookingestdispatchjava.store.EventStore;
+import com.github.feng111627.webhookingestdispatchjava.trace.TraceStore;
 import java.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,17 +44,20 @@ public class WebhookIngestService {
     private final EventHandlerRegistry registry;
     private final DispatchService dispatchService;
     private final ObjectMapper objectMapper;
+    private final TraceStore traceStore;
 
     public WebhookIngestService(SignatureVerifier signatureVerifier,
                                 EventStore eventStore,
                                 EventHandlerRegistry registry,
                                 DispatchService dispatchService,
-                                ObjectMapper objectMapper) {
+                                ObjectMapper objectMapper,
+                                TraceStore traceStore) {
         this.signatureVerifier = signatureVerifier;
         this.eventStore = eventStore;
         this.registry = registry;
         this.dispatchService = dispatchService;
         this.objectMapper = objectMapper;
+        this.traceStore = traceStore;
     }
 
     public IngestResponse receive(String timestampHeader, String signatureHeader, String rawBody) {
@@ -78,6 +84,8 @@ public class WebhookIngestService {
         // 1~2. 时间戳（先缺失后过期）
         signatureVerifier.verify(eventId, timestampHeader, signatureHeader, rawBody)
                 .ifPresent(reason -> {
+                    trace(eventId, TraceStep.REJECTED, reason.name(),
+                            "入口校验拒绝（时间戳/签名）: " + reason);
                     String message = switch (reason) {
                         case TIMESTAMP_MISSING -> "时间戳缺失或不是 Unix 秒，请携带 X-Webhook-Timestamp";
                         case TIMESTAMP_EXPIRED -> "时间戳超出容忍窗口，请检查时钟或重放窗口";
@@ -100,6 +108,8 @@ public class WebhookIngestService {
         if (registry.lookup(eventType).isEmpty()) {
             log.info("[ingest eventId={}] REJECT: 无匹配处理器(type={}) -> UNSUPPORTED_EVENT_TYPE",
                     eventId, eventType);
+            trace(eventId, TraceStep.REJECTED, "UNSUPPORTED_EVENT_TYPE",
+                    "没有匹配事件类型 '" + eventType + "' 的处理器，事件不会被静默丢弃");
             throw new WebhookRejectedException(RejectReason.UNSUPPORTED_EVENT_TYPE,
                     "没有匹配事件类型 '" + eventType + "' 的处理器，事件不会被静默丢弃",
                     HttpStatus.UNPROCESSABLE_ENTITY.value());
@@ -123,11 +133,16 @@ public class WebhookIngestService {
             // 重复请求按成功返回，但绝不再次分发
             log.info("[ingest eventId={}] DUPLICATE: 当前状态 state={} attempts={} -> 返回成功且不再分发",
                     eventId, existing.getState(), existing.getAttempts());
+            trace(eventId, TraceStep.DUPLICATE, "DUPLICATE",
+                    "事件已存在(state=" + existing.getState() + ", attempts=" + existing.getAttempts()
+                            + ")，按成功返回且不再分发");
             return new IngestResponse(eventId, "DUPLICATE",
                     "事件已接收/处理过，按成功返回且不重复分发", existing.getAttempts());
         }
 
         // 6. 首次事件：同步分发（本地演示），成功或死信都在本次请求给出最终结论
+        trace(eventId, TraceStep.RECEIVED, "RECEIVED",
+                "首次接收，占位成功，进入分发(type=" + eventType + ")");
         EventRecord record = eventStore.find(eventId).orElseThrow();
         EventRecord finished = dispatchService.dispatch(record);
         log.info("[ingest eventId={}] 分发结束 state={} failureKind={} attempts={}",
@@ -139,6 +154,10 @@ public class WebhookIngestService {
                         ? "处理成功"
                         : "处理失败已进入死信，可通过 /admin/dead-letters 查询并重放: " + finished.getLastError(),
                 finished.getAttempts());
+    }
+
+    private void trace(String eventId, TraceStep step, String decision, String detail) {
+        traceStore.append(new TraceEntry(eventId, step, decision, detail, Instant.now()));
     }
 
     private static String textField(JsonNode payload, String field) {

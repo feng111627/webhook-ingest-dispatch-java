@@ -55,3 +55,21 @@ curl -sS -X POST "$BASE/admin/dead-letters/evt-2001/replay"; echo
 
 echo "== 10) 对非死信事件重放（期望 409）=="
 curl -sS -o /dev/null -w "http=%{http_code}\n" -X POST "$BASE/admin/dead-letters/evt-1001/replay"
+
+echo "== 11) 修正负载重放：上游把 fail 写错成 permanent，人工修正后重放 =="
+post_event '{"eventId":"evt-3001","eventType":"order.flaky","fail":"permanent","orderId":"O-WRONG","amountCents":-5}'
+echo "-- 携带修正负载重放（fail=ok，修正订单号与金额）--"
+curl -sS -X POST "$BASE/admin/dead-letters/evt-3001/replay" \
+  -H "Content-Type: application/json" \
+  -d '{"payload":{"eventId":"evt-3001","eventType":"order.flaky","fail":"ok","orderId":"O-FIXED","amountCents":19900}}'; echo
+
+echo "== 12) 事件详情：原始负载保留 + 本次重放实际使用的修正负载 =="
+curl -sS "$BASE/admin/events/evt-3001"; echo
+
+echo "== 13) 事件轨迹：从接收到重放成功的完整判定链 =="
+curl -sS "$BASE/admin/events/evt-3001/trace"; echo
+
+echo "== 14) 非法修正负载（eventId 不一致，期望 400）=="
+curl -sS -o /dev/null -w "http=%{http_code}\n" -X POST "$BASE/admin/dead-letters/evt-2002/replay" \
+  -H "Content-Type: application/json" \
+  -d '{"payload":{"eventId":"someone-else","fail":"ok"}}'

@@ -13,7 +13,9 @@
 | --- | --- | --- |
 | POST | `/webhooks/events` | 接收事件（需签名头） |
 | GET | `/admin/dead-letters` | 查询死信列表 |
-| POST | `/admin/dead-letters/{eventId}/replay` | 重放指定死信 |
+| POST | `/admin/dead-letters/{eventId}/replay` | 重放指定死信（可携带修正负载，见 3.1） |
+| GET | `/admin/events/{eventId}` | 事件详情：原始负载 + 全部重放历史 |
+| GET | `/admin/events/{eventId}/trace` | 事件轨迹：每一步判定与依据（见 3.3） |
 
 ### 1.1 事件格式
 
@@ -94,20 +96,55 @@
 - 处理器抛出未预期异常时保守视为 `RETRYABLE`。
 - 死信记录包含：`eventId / eventType / failureKind / attempts / lastError / receivedAt / updatedAt`。
 
-### 3.1 死信重放
+### 3.1 死信重放（支持人工修正负载）
 
 - `GET /admin/dead-letters`：只列出 `DEAD` 事件。
 - `POST /admin/dead-letters/{eventId}/replay`：复用同一条分发链路（含退避重试）。
-  - 事件不存在 → 404；事件不是 DEAD 状态（成功/处理中）→ 409；并发重放只有一个能抢占执行，其余 409。
+  - **不带请求体**：沿用原始负载重放（`payloadSource=ORIGINAL`）。
+  - **携带修正负载**：请求体 `{"payload": {...}}`，本次重放以人工修正后的内容走原分发与重试链路
+    （`payloadSource=CORRECTED`）。规则：
+    - 修正负载必须是 JSON 对象，否则 400；
+    - 修正负载若带 `eventId`，必须与路径中的 eventId 一致，否则 400（防止改错事件）；
+    - 分发路由仍按事件入库时的 `eventType`，修正负载里的 `eventType` 不改变路由；
+    - **原始负载永不被覆盖**：每次重放实际使用的负载来源与修正原文都追加进重放历史，
+      通过 `GET /admin/events/{eventId}` 可查 `originalPayload` 与每次重放的
+      `payloadSource` / `correctedPayload` / 结论，便于事后核对"改了什么、基于什么成功"。
+  - 事件不存在 → 404；事件不是 DEAD 状态（成功/处理中）→ 409。
   - 重放成功：从死信列表消失。
-  - 重放仍失败：继续保留在死信，`failureKind/attempts/lastError` 更新。
+  - 重放仍失败：继续保留在死信，`failureKind/attempts/lastError` 更新，轨迹与详情均可解释。
+- **并发与幂等语义**：`DEAD → PROCESSING` 的抢占在记录锁内原子完成，
+  同一事件同一时刻**只有一个重放真正执行**；并发/重复点击（无论是否携带修正负载）
+  的其余请求一律得到一致的 **409 + 可解释 message**，不会部分执行。
+  重放失败回到 DEAD 后允许再次重放（顺序重放是合法的，并发重放才互斥）。
 - **重放不产生重复副作用**：真实副作用以稳定 key（`处理器前缀:eventId`）登记在 `EffectLedger`，
   已完成的副作用在重试/重放/重复投递命中台账时直接跳过。
+
+### 3.3 事件轨迹（按 eventId 串查判定过程）
+
+`GET /admin/events/{eventId}/trace` 返回该事件从接收到当前的全部判定步骤，按时间升序：
+
+| step | 含义 |
+| --- | --- |
+| `RECEIVED` | 首次接收并占位成功 |
+| `DUPLICATE` | 命中重复（含在途并发），不再分发 |
+| `REJECTED` | 被明确拒绝（签名/时间戳/无处理器/重放不被受理等），decision 携带具体原因码 |
+| `ATTEMPT` | 一次处理尝试的结论（SUCCESS/RETRYABLE/PERMANENT） |
+| `BACKOFF` | 暂时失败后的退避等待（含等待时长） |
+| `DEAD_LETTERED` | 进入死信（PERMANENT 或 RETRYABLE_EXHAUSTED） |
+| `REPLAY_REQUESTED` / `REPLAY_STARTED` | 重放请求到达 / 抢占成功（记录本次负载来源） |
+| `SUCCEEDED` | 处理成功 |
+
+- 每条轨迹都带 `eventId`、机读 `decision` 与人读 `detail`（判定依据），
+  与接口当时返回的结论一一对应（如接口返回 `DEAD` ⇔ 轨迹含 `DEAD_LETTERED`）。
+- 被 422 拒绝的事件**不入库但轨迹可查**（详情 404、轨迹 200），判定不会"查不到"。
+- 完全没有轨迹的 eventId 查询返回 404。
 
 ### 3.2 前向兼容
 
 处理器只读取自己关心的已知字段，负载新增字段（含嵌套对象/数组）一律忽略，
-不会破坏既有处理逻辑（见测试 `extraFutureFields_doNotBreakExistingHandler`）。
+不会破坏既有处理逻辑；轨迹记录、死信重放、修正负载重放对新增字段同样透明
+（修正负载可以携带未来新增字段，原样参与分发与留档）。
+见测试 `extraFutureFields_doNotBreakExistingHandler` 与 `newFieldsInPayload_doNotBreakTraceOrHandling`。
 
 ---
 
@@ -131,14 +168,21 @@
 mvn test
 ```
 
-覆盖场景（21 个用例，正常与异常路径均有断言，日志均带 eventId 与判定依据）：
+覆盖场景（33 个用例，正常与异常路径均有断言，日志均带 eventId 与判定依据）：
 
 - `SignatureAndTimestampIntegrationTest`（10）：合法请求、时间戳缺失/非法/过期/超前/窗口边界、
   签名缺失/错误密钥/负载篡改、坏 JSON/缺字段；
 - `DeduplicationIntegrationTest`（4）：串行重复、**16 线程并发重复**（断言恰好 1 次 SUCCEEDED、
   其余 DUPLICATE、副作用恰好 1 次）、无处理器类型 422、不同 eventId 互不影响；
 - `RetryDeadLetterReplayIntegrationTest`（6）：暂时失败重试到上限入死信、永久失败只尝试 1 次、
-  死信查询、404/409、重放成功且副作用不重复、先失败后成功、负载新增字段前向兼容、死信后重复投递。
+  死信查询、404/409、重放成功且副作用不重复、先失败后成功、负载新增字段前向兼容、死信后重复投递；
+- `ReplayWithCorrectedPayloadIntegrationTest`（4）：修正负载重放成功且原始负载保留可查、
+  修正后仍失败留死信可解释、不带负载重放走原始负载、非法修正负载（非对象/eventId 不一致）400；
+- `ConcurrentReplayIntegrationTest`（3）：**8 线程并发重放恰好 1 个执行**其余 409、
+  混合（带/不带修正负载）并发重放全局恰好 1 个 SUCCEEDED 且副作用恰好 1 次、重放仍失败留死信；
+- `EventTraceIntegrationTest`（5）：全生命周期轨迹与接口结论一一对应、
+  被拒事件不入库但轨迹可查、未知事件轨迹 404、新增嵌套/数组字段不破坏轨迹与处理、
+  重放失败的轨迹可解释。
 
 ### 5.2 一键 curl 演示
 
@@ -151,7 +195,8 @@ mvn spring-boot:run
 ```
 
 脚本依次演示：正常事件 → 重复投递（DUPLICATE）→ 不支持类型（422）→ 签名错误（401）
-→ 时间戳过期（401）→ 暂时失败重试入死信 → 永久失败直入死信 → 查询死信 → 重放 → 409。
+→ 时间戳过期（401）→ 暂时失败重试入死信 → 永久失败直入死信 → 查询死信 → 重放 → 409
+→ 修正负载重放成功 → 事件详情（原始负载 vs 修正负载）→ 事件轨迹。
 
 ### 5.3 手工计算签名
 
@@ -179,7 +224,8 @@ handler/     EventHandler + Registry      按类型路由；impl 下两个演示
 store/       InMemoryEventStore           原子占位去重；记录状态
              EffectLedger                 副作用幂等台账
 service/     WebhookIngestService         接收编排（判定顺序见第 2 节）
-             DispatchService              退避重试 / 永久失败 / 死信
-             DeadLetterService            死信查询与重放
+             DispatchService              退避重试 / 永久失败 / 死信（分发用生效负载）
+             DeadLetterService            死信查询、修正负载重放、重放历史
+trace/       InMemoryTraceStore           事件轨迹（只追加，按 eventId 串查）
 web/         Controller + 全局异常处理     结构化响应
 ```

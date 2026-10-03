@@ -17,6 +17,8 @@ import org.springframework.stereotype.Component;
  *   <li>{@code "retryable"}：始终暂时失败 —— 退避重试到上限后进入死信，重放仍可成功；</li>
  *   <li>{@code "permanent"}：永久失败 —— 首次即判 PERMANENT，不再重试，直接死信；</li>
  *   <li>{@code "retry-then-ok"}：前 {@code failUntil}（默认 2）次尝试暂时失败，之后成功；</li>
+ *   <li>{@code "sleep"}：沉睡 {@code sleepMillis}（默认 1000）毫秒后成功 —— 用于制造"处理中"窗口，
+ *       验证并发重放只有一个真正执行；</li>
  *   <li>其它/缺省：直接成功。</li>
  * </ul>
  */
@@ -80,6 +82,16 @@ public class OrderFlakyEventHandler implements EventHandler {
             log.warn("[handler order.flaky eventId={}] 判定 RETRYABLE：模拟下游不可用(第{}次)", eventId, seen);
             return new HandlerResult(HandlerResult.Outcome.RETRYABLE,
                     "simulated downstream unavailable (attempt " + seen + ")");
+        } else if ("sleep".equalsIgnoreCase(mode)) {
+            long sleepMillis = payload.hasNonNull("sleepMillis") ? payload.get("sleepMillis").asLong(1000) : 1000;
+            log.info("[handler order.flaky eventId={}] sleep 模式：沉睡 {}ms 模拟慢处理（处理中窗口）",
+                    eventId, sleepMillis);
+            try {
+                Thread.sleep(sleepMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            // 落到下面的成功分支
         }
 
         effectLedger.recordIfAbsent(effectKey);

@@ -7,7 +7,11 @@ import com.github.feng111627.webhookingestdispatchjava.model.EventRecord;
 import com.github.feng111627.webhookingestdispatchjava.model.EventState;
 import com.github.feng111627.webhookingestdispatchjava.model.FailureKind;
 import com.github.feng111627.webhookingestdispatchjava.model.HandlerResult;
+import com.github.feng111627.webhookingestdispatchjava.model.TraceEntry;
+import com.github.feng111627.webhookingestdispatchjava.model.TraceStep;
 import com.github.feng111627.webhookingestdispatchjava.store.EventStore;
+import com.github.feng111627.webhookingestdispatchjava.trace.TraceStore;
+import java.time.Instant;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -32,11 +36,14 @@ public class DispatchService {
     private final EventHandlerRegistry registry;
     private final EventStore eventStore;
     private final WebhookProperties properties;
+    private final TraceStore traceStore;
 
-    public DispatchService(EventHandlerRegistry registry, EventStore eventStore, WebhookProperties properties) {
+    public DispatchService(EventHandlerRegistry registry, EventStore eventStore,
+                           WebhookProperties properties, TraceStore traceStore) {
         this.registry = registry;
         this.eventStore = eventStore;
         this.properties = properties;
+        this.traceStore = traceStore;
     }
 
     /**
@@ -60,7 +67,8 @@ public class DispatchService {
             try {
                 log.info("[dispatch eventId={}] type={} 第 {}/{} 次尝试开始",
                         eventId, handler.eventType(), attempt, maxAttempts);
-                result = handler.handle(eventId, current.getPayload());
+                // 重放携带修正负载时，本次分发处理的是修正后的内容；原始负载不被改写
+                result = handler.handle(eventId, current.effectivePayload());
             } catch (RuntimeException ex) {
                 // 未预期异常：保守归类为可重试
                 result = new HandlerResult(HandlerResult.Outcome.RETRYABLE,
@@ -68,6 +76,10 @@ public class DispatchService {
                 log.warn("[dispatch eventId={}] 第{}次尝试抛出异常，保守判定 RETRYABLE: {}",
                         eventId, attempt, ex.toString());
             }
+
+            trace(eventId, TraceStep.ATTEMPT, result.outcome().name(),
+                    "第 " + attempt + "/" + maxAttempts + " 次尝试 -> " + result.outcome()
+                            + "（依据: " + result.reason() + "）");
 
             int finalAttempt = attempt;
             HandlerResult finalResult = result;
@@ -90,11 +102,15 @@ public class DispatchService {
             switch (result.outcome()) {
                 case SUCCESS -> {
                     log.info("[dispatch eventId={}] 第{}次尝试 SUCCESS -> 事件完成", eventId, attempt);
+                    trace(eventId, TraceStep.SUCCEEDED, "SUCCEEDED",
+                            "第 " + attempt + " 次尝试成功，事件完成");
                     return eventStore.find(eventId).orElseThrow();
                 }
                 case PERMANENT -> {
                     log.warn("[dispatch eventId={}] 第{}次尝试 PERMANENT(reason={}) -> 立即进入死信，不再重试",
                             eventId, attempt, result.reason());
+                    trace(eventId, TraceStep.DEAD_LETTERED, "PERMANENT",
+                            "永久失败（不再重试）: " + result.reason());
                     return eventStore.find(eventId).orElseThrow();
                 }
                 case RETRYABLE -> {
@@ -107,11 +123,15 @@ public class DispatchService {
                         });
                         log.warn("[dispatch eventId={}] 已达最大尝试次数{} -> 进入死信(RETRYABLE)",
                                 eventId, maxAttempts);
+                        trace(eventId, TraceStep.DEAD_LETTERED, "RETRYABLE_EXHAUSTED",
+                                "重试上限耗尽(" + maxAttempts + " 次)，进入死信");
                         return eventStore.find(eventId).orElseThrow();
                     }
                     long backoff = backoffMillis(attempt);
                     log.info("[dispatch eventId={}] 第{}次尝试 RETRYABLE -> {}ms 后退避重试",
                             eventId, attempt, backoff);
+                    trace(eventId, TraceStep.BACKOFF, "RETRYABLE",
+                            "第 " + attempt + " 次暂时失败，" + backoff + "ms 后退避重试");
                     sleep(backoff);
                 }
             }
@@ -121,7 +141,8 @@ public class DispatchService {
 
     /** 重放时从第一条记录开始重新分发（处理器侧副作用有幂等保护） */
     public EventRecord redispatch(EventRecord record) {
-        log.info("[dispatch eventId={}] 死信重放开始：重置状态为 PROCESSING", record.getEventId());
+        log.info("[dispatch eventId={}] 死信重放开始：重置状态为 PROCESSING，负载来源={}",
+                record.getEventId(), record.getReplayPayload() != null ? "CORRECTED" : "ORIGINAL");
         eventStore.update(record.getEventId(), r -> {
             r.setState(EventState.PROCESSING);
             r.setFailureKind(FailureKind.NONE);
@@ -129,6 +150,10 @@ public class DispatchService {
             return r;
         });
         return dispatch(record);
+    }
+
+    private void trace(String eventId, TraceStep step, String decision, String detail) {
+        traceStore.append(new TraceEntry(eventId, step, decision, detail, Instant.now()));
     }
 
     private void markProcessing(String eventId) {
