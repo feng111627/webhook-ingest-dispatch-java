@@ -73,3 +73,16 @@ echo "== 14) 非法修正负载（eventId 不一致，期望 400）=="
 curl -sS -o /dev/null -w "http=%{http_code}\n" -X POST "$BASE/admin/dead-letters/evt-2002/replay" \
   -H "Content-Type: application/json" \
   -d '{"payload":{"eventId":"someone-else","fail":"ok"}}'
+
+echo "== 15) 并发重放同一死信（5 个请求同时打，期望恰好 1 个执行、其余一致的 409）=="
+post_event '{"eventId":"evt-4001","eventType":"order.flaky","fail":"permanent"}'
+for i in 1 2 3 4 5; do
+  curl -sS -X POST "$BASE/admin/dead-letters/evt-4001/replay" \
+    -H "Content-Type: application/json" \
+    -d '{"payload":{"eventId":"evt-4001","fail":"ok","sleepMillis":1500}}' \
+    > "/tmp/replay-$i.json" &
+done
+wait
+for i in 1 2 3 4 5; do echo "  请求$i -> $(cat /tmp/replay-$i.json)"; done
+echo "-- 重放历史（期望恰好一条）--"
+curl -sS "$BASE/admin/events/evt-4001"; echo

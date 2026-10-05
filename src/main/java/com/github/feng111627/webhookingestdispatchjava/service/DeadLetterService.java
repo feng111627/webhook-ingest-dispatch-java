@@ -28,8 +28,9 @@ import org.springframework.web.server.ResponseStatusException;
  *   <li>只有 DEAD 状态允许重放；不存在 404，非 DEAD 409；</li>
  *   <li>重放可携带人工修正后的负载：本次分发处理修正内容，原始负载永不被覆盖，
  *       每次重放实际使用的负载来源与修正原文都写入重放历史，可随时查询核对；</li>
- *   <li>并发/重复重放：DEAD -> PROCESSING 的抢占在记录锁内原子完成，
- *       同一事件同一时刻只有一个重放真正执行，其余得到一致的 409 结论；</li>
+ *   <li>并发/重复重放：状态判定与 DEAD -> PROCESSING 的抢占在记录锁内原子完成（唯一判定点），
+ *       同一事件同一时刻只有一个重放真正执行，其余得到一致的 409（REPLAY_IN_PROGRESS）结论；
+ *       拒绝消息一律使用锁内状态快照，与事件当时真实状态严格一致；</li>
  *   <li>重放复用同一分发链路（含退避重试），成功后从死信列表消失；
  *       仍失败则留在死信，failureKind/attempts/lastError 更新可查；</li>
  *   <li>处理器内副作用经台账幂等保护，重放不会产生重复副作用。</li>
@@ -101,19 +102,14 @@ public class DeadLetterService {
                     return new ResponseStatusException(HttpStatus.NOT_FOUND, "事件不存在: " + eventId);
                 });
 
-        if (record.getState() != EventState.DEAD) {
-            log.warn("[deadletter eventId={}] 重放被拒绝：当前状态 {} 不是 DEAD -> 409",
-                    eventId, record.getState());
-            trace(eventId, TraceStep.REJECTED, "REPLAY_NOT_DEAD",
-                    "重放被拒绝：当前状态 " + record.getState() + "，只有 DEAD 状态允许重放");
-            throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    "事件当前状态为 " + record.getState() + "，只有 DEAD 状态允许重放");
-        }
-
-        // 在记录锁内原子完成：DEAD -> PROCESSING 抢占 + 登记本次实际使用的负载 + 追加重放历史。
-        // 并发/重复重放（无论是否携带修正负载）只会有一个在此抢占成功，其余拿到一致的 409。
+        // 唯一判定点：在记录锁内原子完成"读取当前状态快照 + DEAD -> PROCESSING 抢占 +
+        // 登记本次实际使用的负载 + 追加重放历史"。并发/重复重放（无论是否携带修正负载）
+        // 只会有一个在此抢占成功，其余全部在锁内拿到同一个状态快照并被拒绝，
+        // 拒绝消息一律使用该快照，保证结论与事件当时真实状态严格一致、措辞统一。
+        EventState[] observed = new EventState[1];
         boolean[] claimed = {false};
         eventStore.update(eventId, r -> {
+            observed[0] = r.getState();
             if (r.getState() == EventState.DEAD) {
                 r.setState(EventState.PROCESSING);
                 r.setReplayPayload(correctedPayload);
@@ -129,10 +125,28 @@ public class DeadLetterService {
             return r;
         });
         if (!claimed[0]) {
-            log.warn("[deadletter eventId={}] 重放被拒绝：已有重放在执行 -> 409", eventId);
-            trace(eventId, TraceStep.REJECTED, "REPLAY_IN_PROGRESS",
-                    "重放被拒绝：该事件已有重放在执行（并发重放只会有一个真正执行）");
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "该事件已有重放在执行");
+            EventState state = observed[0];
+            if (state == null) {
+                // find 之后记录被移除（内存实现不会发生，防御性兜底）
+                log.warn("[deadletter eventId={}] 重放被拒绝：事件不存在 -> 404", eventId);
+                trace(eventId, TraceStep.REJECTED, "EVENT_NOT_FOUND", "重放被拒绝：事件不存在");
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "事件不存在: " + eventId);
+            }
+            if (state == EventState.PROCESSING) {
+                log.warn("[deadletter eventId={}] 重放被拒绝：已有重放在执行(state=PROCESSING) -> 409 REPLAY_IN_PROGRESS",
+                        eventId);
+                trace(eventId, TraceStep.REJECTED, "REPLAY_IN_PROGRESS",
+                        "重放被拒绝：该事件已有重放在执行，同一死信并发重放只会有一个真正执行");
+                throw new ResponseStatusException(HttpStatus.CONFLICT,
+                        "该事件已有重放在执行（当前状态 PROCESSING）："
+                                + "同一死信并发重放只会有一个真正执行，本次请求未被执行，请待其完成后查询结果");
+            }
+            log.warn("[deadletter eventId={}] 重放被拒绝：当前状态 {} 不是 DEAD -> 409 REPLAY_NOT_DEAD",
+                    eventId, state);
+            trace(eventId, TraceStep.REJECTED, "REPLAY_NOT_DEAD",
+                    "重放被拒绝：当前状态 " + state + "，只有 DEAD 状态允许重放");
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "事件当前状态为 " + state + "，只有 DEAD 状态允许重放");
         }
 
         String payloadSource = correctedPayload != null ? "CORRECTED" : "ORIGINAL";

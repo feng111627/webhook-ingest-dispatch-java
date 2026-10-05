@@ -17,10 +17,12 @@ import org.springframework.stereotype.Component;
  *   <li>{@code "retryable"}：始终暂时失败 —— 退避重试到上限后进入死信，重放仍可成功；</li>
  *   <li>{@code "permanent"}：永久失败 —— 首次即判 PERMANENT，不再重试，直接死信；</li>
  *   <li>{@code "retry-then-ok"}：前 {@code failUntil}（默认 2）次尝试暂时失败，之后成功；</li>
- *   <li>{@code "sleep"}：沉睡 {@code sleepMillis}（默认 1000）毫秒后成功 —— 用于制造"处理中"窗口，
- *       验证并发重放只有一个真正执行；</li>
+ *   <li>{@code "sleep"}：沉睡后成功（等价于缺省成功 + {@code sleepMillis}）；</li>
  *   <li>其它/缺省：直接成功。</li>
  * </ul>
+ *
+ * <p>另外，任何模式下都可携带 {@code sleepMillis}（毫秒）：先在"处理中"沉睡指定时长再判定结论，
+ * 用于确定性地撑开"重放执行中"窗口，验证并发重放只有一个真正执行（含仍会失败的场景）。
  */
 @Component
 public class OrderFlakyEventHandler implements EventHandler {
@@ -50,6 +52,18 @@ public class OrderFlakyEventHandler implements EventHandler {
     public HandlerResult handle(String eventId, JsonNode payload) {
         String mode = payload != null && payload.hasNonNull("fail")
                 ? payload.get("fail").asText() : "ok";
+
+        // 通用慢处理窗口：任何模式都可先沉睡再判定，用于确定性地制造"处理中"窗口
+        long sleepMillis = payload != null && payload.hasNonNull("sleepMillis")
+                ? payload.get("sleepMillis").asLong(0) : 0;
+        if (sleepMillis > 0) {
+            log.info("[handler order.flaky eventId={}] 沉睡 {}ms 模拟慢处理（处理中窗口）", eventId, sleepMillis);
+            try {
+                Thread.sleep(sleepMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
 
         // 永久失败：不做副作用，由分发器立即置死信
         if ("permanent".equalsIgnoreCase(mode)) {
@@ -83,13 +97,14 @@ public class OrderFlakyEventHandler implements EventHandler {
             return new HandlerResult(HandlerResult.Outcome.RETRYABLE,
                     "simulated downstream unavailable (attempt " + seen + ")");
         } else if ("sleep".equalsIgnoreCase(mode)) {
-            long sleepMillis = payload.hasNonNull("sleepMillis") ? payload.get("sleepMillis").asLong(1000) : 1000;
-            log.info("[handler order.flaky eventId={}] sleep 模式：沉睡 {}ms 模拟慢处理（处理中窗口）",
-                    eventId, sleepMillis);
-            try {
-                Thread.sleep(sleepMillis);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+            // 兼容旧用法：未显式给 sleepMillis 时默认沉睡 1000ms 后成功
+            if (sleepMillis <= 0) {
+                log.info("[handler order.flaky eventId={}] sleep 模式：默认沉睡 1000ms", eventId);
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }
             // 落到下面的成功分支
         }
