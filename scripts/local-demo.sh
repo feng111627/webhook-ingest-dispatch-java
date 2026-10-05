@@ -73,3 +73,22 @@ echo "== 14) 非法修正负载（eventId 不一致，期望 400）=="
 curl -sS -o /dev/null -w "http=%{http_code}\n" -X POST "$BASE/admin/dead-letters/evt-2002/replay" \
   -H "Content-Type: application/json" \
   -d '{"payload":{"eventId":"someone-else","fail":"ok"}}'
+
+echo "== 15) 并发重放同一死信 evt-2002（5 个并发、混合带/不带修正负载：恰好 1 个被受理，其余统一 409）=="
+for i in 1 2 3 4 5; do
+  if [ $((i % 2)) -eq 0 ]; then
+    curl -sS -o "/tmp/replay-$$-$i.out" -w "#$i http=%{http_code}\n" \
+      -X POST "$BASE/admin/dead-letters/evt-2002/replay" \
+      -H "Content-Type: application/json" \
+      -d '{"payload":{"eventId":"evt-2002","fail":"sleep","sleepMillis":1500}}' &
+  else
+    curl -sS -o "/tmp/replay-$$-$i.out" -w "#$i http=%{http_code}\n" \
+      -X POST "$BASE/admin/dead-letters/evt-2002/replay" &
+  fi
+done
+wait
+echo "-- 各响应内容（恰好 1 个 2xx 受理结论，其余为完全一致的 409 拒绝）--"
+for i in 1 2 3 4 5; do echo "#$i: $(cat "/tmp/replay-$$-$i.out")"; rm -f "/tmp/replay-$$-$i.out"; done
+
+echo "== 16) evt-2002 事件详情：重放历史里只有被受理的那一次 =="
+curl -sS "$BASE/admin/events/evt-2002"; echo

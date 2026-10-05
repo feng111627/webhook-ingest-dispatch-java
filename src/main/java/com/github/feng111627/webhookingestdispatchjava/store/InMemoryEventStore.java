@@ -59,13 +59,14 @@ public class InMemoryEventStore implements EventStore {
         return Optional.ofNullable(records.get(eventId));
     }
 
-    /** 在记录对象锁内更新，避免重试与重放并发时状态互相覆盖 */
+    /** 在记录对象锁内更新，避免重试与重放并发时状态互相覆盖；统一刷新 updatedAt */
     @Override
     public void update(String eventId, UnaryOperator<EventRecord> mutator) {
         records.computeIfPresent(eventId, (key, current) -> {
             synchronized (current) {
                 EventRecord updated = mutator.apply(current);
                 updated.setEventId(key);
+                updated.setUpdatedAt(java.time.Instant.now());
                 return updated;
             }
         });
